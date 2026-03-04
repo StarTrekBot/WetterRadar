@@ -1,0 +1,485 @@
+package com.wetterradar
+
+import android.Manifest // Berechtigung nicht mehr benötigt für Standortanzeige
+import android.app.AlertDialog
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.Menu
+import android.view.MenuItem
+import android.widget.Button
+import android.widget.EditText
+import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.Toolbar
+
+import androidx.core.content.ContextCompat // Für ContextCompat.getDrawable
+import androidx.preference.PreferenceManager
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.BoundingBox
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Overlay
+// NEU: Importe für IconOverlay und Drawable
+import org.osmdroid.views.overlay.IconOverlay
+import android.graphics.drawable.Drawable
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.*
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var mapView: MapView
+    private lateinit var statusTextView: TextView
+    private lateinit var timeTextView: TextView
+    private lateinit var downloadButton: Button
+    private lateinit var playButton: Button
+    private lateinit var radarDownloadManager: RadarDownloadManager
+
+    // NEU: Variable für den Standort-IconOverlay (statt Marker)
+    private var locationIconOverlay: IconOverlay? = null
+    private var currentRadarOverlay: BitmapOverlay? = null
+    private var currentRadarBitmap: Bitmap? = null
+
+    private var currentRadarIndex = 0
+    private val maxRadarIndex: Int
+        get() = RadarDownloadManager.DATASET_SIZE - 1
+
+    private var overlayTransparency: Float = 0.4f
+
+    private var isAnimationRunning = false
+    private val animationHandler = Handler(Looper.getMainLooper())
+    private val animationRunnable = object : Runnable {
+        override fun run() {
+            if (isAnimationRunning) {
+                currentRadarIndex = (currentRadarIndex + 1) % (maxRadarIndex + 1)
+                loadAndDisplayRadarBitmap(currentRadarIndex)
+                animationHandler.postDelayed(this, 3000)
+            }
+        }
+    }
+
+    private var downloadStartTime: Long = 0
+
+    private val radarBoundingBox = BoundingBox(
+        55.5533029, 16.0888267, 46.5009905, 4.4286943
+    )
+
+    // --- Variablen für gespeicherten Fallback-Standort ---
+    private val PREFS_NAME = "LocationPrefs"
+    private val PREF_LATITUDE = "latitude"
+    private val PREF_LONGITUDE = "longitude"
+    private val DEFAULT_LATITUDE = 51.5
+    private val DEFAULT_LONGITUDE = 10.0
+    // -----------------------------------------------------------
+
+
+    // Toolbar hinzufügen
+    private lateinit var toolbar: Toolbar
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        Configuration.getInstance().load(this, PreferenceManager.getDefaultSharedPreferences(this))
+
+        setContentView(R.layout.activity_main)
+
+        // Toolbar initialisieren
+        toolbar = findViewById(R.id.toolbar)
+        setSupportActionBar(toolbar)
+        supportActionBar?.title = getString(R.string.app_name) // Zeigt den App-Namen als Titel an
+
+        mapView = findViewById(R.id.mapView)
+        statusTextView = findViewById(R.id.statusTextView)
+        timeTextView = findViewById(R.id.timeTextView)
+        downloadButton = findViewById(R.id.downloadButton)
+        playButton = findViewById(R.id.playButton)
+
+        setupMap()
+
+        val radarWidth = 1108
+        val radarHeight = 1360
+        radarDownloadManager = RadarDownloadManager(this, radarWidth, radarHeight)
+
+        // NEU: Standort-IconOverlay erstellen und hinzufügen
+        addLocationIconOverlay()
+
+        setupUI()
+
+        // Karte auf gespeicherten Fallback-Standort oder Standard zentrieren
+        centerMapOnStoredLocation()
+
+        startDownloadSequence()
+    }
+
+    private fun setupMap() {
+        mapView.setTileSource(TileSourceFactory.MAPNIK)
+        mapView.setBuiltInZoomControls(true)
+        mapView.setMultiTouchControls(true)
+        // Keine feste Zentrierung/Zoomstufe hier
+    }
+
+    // --- NEU: Methode zum Erstellen und Hinzufügen des Standort-IconOverlays ---
+    private fun addLocationIconOverlay() {
+        // Entferne vorheriges Overlay, falls vorhanden
+        locationIconOverlay?.let { overlay ->
+            mapView.overlays.remove(overlay)
+        }
+
+        // Lade den gespeicherten Standort
+        val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedLat = sharedPreferences.getFloat(PREF_LATITUDE, DEFAULT_LATITUDE.toFloat()).toDouble()
+        val savedLon = sharedPreferences.getFloat(PREF_LONGITUDE, DEFAULT_LONGITUDE.toFloat()).toDouble()
+
+        // Erstelle einen GeoPoint für die Position
+        val iconPoint = GeoPoint(savedLat, savedLon)
+
+        // Lade das Icon (z.B. red_dot.xml oder red_dot.png aus res/drawable)
+        // Stelle sicher, dass du eine entsprechende Ressource hast
+        val iconDrawable: Drawable? = ContextCompat.getDrawable(this, R.drawable.fadenkreuz1_50r) // Passe den Namen an
+
+        // Erstelle das IconOverlay
+        // IconOverlay hat einen Konstruktor, der nur GeoPoint und Drawable benötigt
+        val newIconOverlay = if (iconDrawable != null) {
+            IconOverlay(iconPoint, iconDrawable)
+        } else {
+            // Fallback: Verwende ein Standard-Icon oder überspringe das Overlay
+            Log.w("MainActivity", "Drawable R.drawable.red_dot nicht gefunden. Kein Standort-IconOverlay erstellt.")
+            return // Verlasse die Funktion, wenn kein Icon verfügbar ist
+        }
+
+        // Optional: Setze eine Beschreibung (entspricht Marker.setTitle() + setSnippet() nicht direkt,
+        // aber kann für Interaktionen genutzt werden)
+        // newIconOverlay.title = "Gespeicherter Standort"
+        // newIconOverlay.description = "Lat: $savedLat, Lng: $savedLon"
+
+        // Optional: Setze einen OnItemGestureListener, um z.B. bei Klick eine Info anzuzeigen
+        // newIconOverlay.setOnItemGestureListener(...)
+
+        // Füge das neue Overlay zur Karte hinzu
+        mapView.overlays.add(newIconOverlay)
+        locationIconOverlay = newIconOverlay
+        mapView.invalidate() // Zeichne die Karte neu
+    }
+    // -----------------------------------------------------------
+
+
+    // Methode zum Zentrieren auf gespeicherten Standort
+    private fun centerMapOnStoredLocation() {
+        val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedLat = sharedPreferences.getFloat(PREF_LATITUDE, DEFAULT_LATITUDE.toFloat()).toDouble()
+        val savedLon = sharedPreferences.getFloat(PREF_LONGITUDE, DEFAULT_LONGITUDE.toFloat()).toDouble()
+
+        if (savedLat == DEFAULT_LATITUDE && savedLon == DEFAULT_LONGITUDE) {
+            // Kein gespeicherter Standort, zeige Deutschland
+            mapView.controller.setZoom(6.0)
+            mapView.controller.setCenter(GeoPoint(DEFAULT_LATITUDE, DEFAULT_LONGITUDE))
+            statusTextView.text = "Kein gespeicherter Standort. Zeige Deutschland."
+        } else {
+            // Verwende gespeicherten Standort
+            mapView.controller.setZoom(12.0)
+            mapView.controller.setCenter(GeoPoint(savedLat, savedLon))
+            statusTextView.text = "Zeige gespeicherten Standort."
+        }
+    }
+
+
+    // Methode zum Speichern des Standorts
+    private fun saveLocationToPreferences(lat: Double, lon: Double) {
+        val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        with(sharedPreferences.edit()) {
+            putFloat(PREF_LATITUDE, lat.toFloat())
+            putFloat(PREF_LONGITUDE, lon.toFloat())
+            apply()
+        }
+        Log.d("MainActivity", "Standort gespeichert: $lat, $lon")
+    }
+
+    // Methode zum Öffnen des Einstellungsdialogs
+    private fun openLocationSettingsDialog() {
+        val dialogView = layoutInflater.inflate(R.layout.dialog_location_settings, null)
+        val builder = AlertDialog.Builder(this)
+        builder.setView(dialogView)
+        val dialog = builder.create()
+
+        val buttonGetCurrentLocation: Button = dialogView.findViewById(R.id.buttonGetCurrentLocation)
+        val editTextLatitude: EditText = dialogView.findViewById(R.id.editTextLatitude)
+        val editTextLongitude: EditText = dialogView.findViewById(R.id.editTextLongitude)
+        val buttonSaveLocation: Button = dialogView.findViewById(R.id.buttonSaveLocation)
+
+        // Zeige den aktuellen gespeicherten Standort im Dialog an
+        val sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedLat = sharedPreferences.getFloat(PREF_LATITUDE, DEFAULT_LATITUDE.toFloat()).toDouble()
+        val savedLon = sharedPreferences.getFloat(PREF_LONGITUDE, DEFAULT_LONGITUDE.toFloat()).toDouble()
+        if (savedLat != DEFAULT_LATITUDE || savedLon != DEFAULT_LONGITUDE) {
+            editTextLatitude.setText(savedLat.toString())
+            editTextLongitude.setText(savedLon.toString())
+        }
+
+        // Entferne die Standortabfrage-Funktionalität aus dem Dialog
+        buttonGetCurrentLocation.setOnClickListener {
+            Toast.makeText(this, "Standortabfrage wurde entfernt. Bitte manuell eingeben.", Toast.LENGTH_SHORT).show()
+        }
+
+        buttonSaveLocation.setOnClickListener {
+            val latStr = editTextLatitude.text.toString()
+            val lonStr = editTextLongitude.text.toString()
+            try {
+                val lat = latStr.toDouble()
+                val lon = lonStr.toDouble()
+                if (lat in -90.0..90.0 && lon in -180.0..180.0) {
+                    saveLocationToPreferences(lat, lon)
+                    // Zentriere Karte auf den neuen Standort
+                    mapView.controller.setZoom(12.0)
+                    mapView.controller.setCenter(GeoPoint(lat, lon))
+                    statusTextView.text = "Neuer Standort gespeichert und angezeigt."
+
+                    // --- NEU: Aktualisiere das IconOverlay ---
+                    addLocationIconOverlay()
+                    // -------------------------------
+
+                    dialog.dismiss()
+                } else {
+                    Toast.makeText(this, "Ungültige Koordinaten!", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: NumberFormatException) {
+                Toast.makeText(this, "Bitte gültige Zahlen eingeben!", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        dialog.show()
+    }
+
+
+    // onCreateOptionsMenu zum Hinzufügen des Menüeintrags
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        menuInflater.inflate(R.menu.menu_main, menu)
+        return true
+    }
+
+    // onOptionsItemSelected zum Behandeln des Klicks
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        return when (item.itemId) {
+            R.id.action_settings -> {
+                openLocationSettingsDialog()
+                true
+            }
+            else -> super.onOptionsItemSelected(item)
+        }
+    }
+
+
+    // NEU: onResume und onPause anpassen (entferne Standort-Overlay-Logik)
+    override fun onResume() {
+        super.onResume()
+        mapView.onResume()
+        // Keine Standort-Overlay-Aktivierung mehr
+    }
+
+    override fun onPause() {
+        super.onPause()
+        mapView.onPause()
+        stopAnimation()
+        // Keine Standort-Overlay-Deaktivierung mehr
+    }
+
+
+    // ... (Rest der MainActivity Methoden bleiben weitgehend gleich, aber entferne Standort-Overlay-Logik) ...
+
+    private fun hasPermissions(): Boolean {
+        // Alte Berechtigungen nicht mehr relevant
+        // Neue Berechtigungen (z.B. für Standortabfrage) werden nicht mehr benötigt
+        return true
+    }
+
+    private fun setupUI() {
+        downloadButton.setOnClickListener {
+            startDownloadSequence()
+        }
+
+        playButton.setOnClickListener {
+            if (isAnimationRunning) {
+                stopAnimation()
+            } else {
+                startAnimation()
+            }
+        }
+    }
+
+    private fun startDownloadSequence() {
+        statusTextView.text = "Lade Radarbilder herunter..."
+        timeTextView.text = "--:--"
+        downloadStartTime = roundDownloadStartTime(System.currentTimeMillis())
+        radarDownloadManager.startDownloadSequence(object : RadarDownloadManager.DownloadCallback {
+            override fun onProgress(current: Int, total: Int) {
+                runOnUiThread {
+                    statusTextView.text = "Lade... $current / $total"
+                }
+            }
+
+            override fun onError(errorMessage: String) {
+                runOnUiThread {
+                    statusTextView.text = "Fehler: $errorMessage"
+                    timeTextView.text = "--:--"
+                    Log.e("MainActivity", "Download Error: $errorMessage")
+                    Toast.makeText(this@MainActivity, "Download fehlgeschlagen: $errorMessage", Toast.LENGTH_LONG).show()
+                }
+            }
+
+            override fun onComplete() {
+                runOnUiThread {
+                    statusTextView.text = "Download abgeschlossen."
+                    if (!isAnimationRunning) {
+                        startAnimation()
+                    } else {
+                        loadAndDisplayRadarBitmap(currentRadarIndex)
+                    }
+                }
+            }
+        })
+    }
+
+    private fun roundDownloadStartTime(timeMillis: Long): Long {
+        val calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            timeInMillis = timeMillis
+        }
+        val minute = calendar.get(Calendar.MINUTE)
+        val roundedMinute = ((minute + 4) / 5) * 5
+        if (roundedMinute >= 60) {
+            calendar.add(Calendar.HOUR_OF_DAY, 1)
+            calendar.set(Calendar.MINUTE, 0)
+        } else {
+            calendar.set(Calendar.MINUTE, roundedMinute)
+        }
+        calendar.set(Calendar.SECOND, 0)
+        calendar.set(Calendar.MILLISECOND, 0)
+        return calendar.timeInMillis
+    }
+
+    private fun startAnimation() {
+        if (!isAnimationRunning) {
+            isAnimationRunning = true
+            playButton.text = "Stop"
+            statusTextView.text = "Animation gestartet."
+            animationHandler.post(animationRunnable)
+            loadAndDisplayRadarBitmap(currentRadarIndex)
+        }
+    }
+
+    private fun stopAnimation() {
+        if (isAnimationRunning) {
+            isAnimationRunning = false
+            playButton.text = "Start"
+            statusTextView.text = "Animation gestoppt."
+            animationHandler.removeCallbacks(animationRunnable)
+        }
+    }
+
+    private fun loadAndDisplayRadarBitmap(index: Int) {
+        if (radarDownloadManager.radarCacheFileExists(index)) {
+            val bitmap = loadRadarBitmap(index)
+            if (bitmap != null) {
+                val imageTime = calculateImageTime(index)
+                val timeString = formatTimeForDisplay(imageTime)
+                timeTextView.text = timeString
+
+                currentRadarOverlay?.let { overlay -> mapView.overlays.remove(overlay) }
+
+                val newRadarOverlay = BitmapOverlay(bitmap, radarBoundingBox, overlayTransparency)
+                mapView.overlays.add(newRadarOverlay)
+                currentRadarOverlay = newRadarOverlay
+
+                // --- NEU: Stelle sicher, dass das IconOverlay über dem Radar liegt ---
+                // Entferne und füge das IconOverlay erneut hinzu, nachdem das Radar-Overlay hinzugefügt wurde
+                locationIconOverlay?.let { overlay ->
+                    mapView.overlays.remove(overlay)
+                    mapView.overlays.add(overlay)
+                }
+                // --------------------------------------------------------------------------
+
+                mapView.invalidate()
+            } else {
+                timeTextView.text = "--:--"
+                Log.e("MainActivity", "Fehler beim Decodieren des Radars für Index $index")
+            }
+        } else {
+            timeTextView.text = "--:--"
+        }
+    }
+
+    private fun calculateImageTime(index: Int): Long {
+        return downloadStartTime + (index * 5 * 60 * 1000L)
+    }
+
+    private fun formatTimeForDisplay(timeMillis: Long): String {
+        val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
+        return sdf.format(Date(timeMillis))
+    }
+
+    private fun loadRadarBitmap(index: Int): Bitmap? {
+        val file = getRadarFile(index)
+        Log.d("MainActivity", "Attempting to load radar bitmap for index $index from: ${file.absolutePath}")
+
+        if (!file.exists()) {
+            Log.e("MainActivity", "Radar file does not exist for index $index: ${file.absolutePath}")
+            return null
+        }
+
+        if (file.length() == 0L) {
+            Log.e("MainActivity", "Radar file is empty for index $index: ${file.absolutePath}")
+            return null
+        }
+
+        return try {
+            val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+            if (bitmap == null) {
+                Log.e("MainActivity", "BitmapFactory.decodeFile returned null for index $index. File might be corrupted or not an image: ${file.absolutePath}")
+                val header = ByteArray(8)
+                file.inputStream().use { it.read(header) }
+                Log.d("MainActivity", "File header bytes (index $index): ${header.joinToString(", ") { "0x%02X".format(it) }}")
+            } else {
+                Log.d("MainActivity", "Successfully loaded bitmap for index $index. Size: ${bitmap.width}x${bitmap.height}")
+            }
+            bitmap
+        } catch (e: OutOfMemoryError) {
+            Log.e("MainActivity", "OutOfMemoryError while decoding bitmap for index $index: ${e.message}", e)
+            null
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error decoding bitmap for index $index: ${e.message}", e)
+            null
+        }
+    }
+
+    private fun getRadarFile(index: Int): File {
+        val cacheDir = File(getExternalFilesDir(null), "radar_cache")
+        return File(cacheDir, "radarMN-$index.png")
+    }
+
+
+    override fun onDestroy() {
+        super.onDestroy()
+        radarDownloadManager.shutdown()
+        currentRadarBitmap?.recycle()
+        currentRadarBitmap = null
+        animationHandler.removeCallbacks(animationRunnable)
+        // Standort-IconOverlay sauber entfernen
+        locationIconOverlay?.let { overlay ->
+            mapView.overlays.remove(overlay)
+            // IconOverlay benötigt keine onDetach-Methode wie MyLocationNewOverlay
+        }
+        locationIconOverlay = null
+    }
+
+    companion object {
+        // Berechtigungs-Code kann entfernt werden, wenn nicht mehr benötigt
+        // private const val PERMISSION_REQUEST_CODE = 100
+        // private const val PERMISSION_REQUEST_CODE_LOCATION_DIALOG = 102
+    }
+}

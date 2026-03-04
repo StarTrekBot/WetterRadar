@@ -1,0 +1,170 @@
+// WetterRadar/app/src/main/java/com/wetterradar/RadarDownloadManager.kt
+
+package com.wetterradar
+
+import android.content.Context
+import android.util.Log
+import okhttp3.*
+import okio.buffer
+import okio.sink
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
+import java.io.*
+
+/**
+ * Diese Klasse ist verantwortlich für den Download und die Vorbereitung
+ * der RADOLAN-Daten (z.B. RW-Produkt) für die weitere Verzeichnis.
+ * Sie nutzt OkHttp für den Download und kann .bz2-Dateien entpacken.
+ */
+object RadarDownloadManager {
+
+    private const val TAG = "RadarDownloadManager"
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+
+    // Basis-URL für das Verzeichnis mit RW-Daten
+    private const val RW_BASE_URL = "https://opendata.dwd.de/weather/radar/radolan/rw/"
+    // Verwende die 'latest' RW-Datei im bz2-Format
+    private const val RW_LATEST_FILENAME = "raa01-rw_10000-latest-dwd---bin.bz2"
+    private const val RW_LATEST_URL = "$RW_BASE_URL$RW_LATEST_FILENAME"
+
+    // Verzeichnis innerhalb des App-Speichers für Radar-Daten
+    private fun getRadarDataDir(context: Context): File {
+        val filesDir = context.getExternalFilesDir(null) // oder context.filesDir für internen Speicher
+        if (filesDir == null) {
+            Log.e(TAG, "App-Verzeichnis ist null. Externer Speicher möglicherweise nicht verfügbar.")
+            return File("") // Rückgabewert, aber wird in downloadAndPrepare verwendet
+        }
+        val radarDir = File(filesDir, "radar_data")
+        if (!radarDir.exists()) {
+            val created = radarDir.mkdirs()
+            if (created) {
+                Log.d(TAG, "Radar-Daten-Verzeichnis erstellt: ${radarDir.absolutePath}")
+            } else {
+                Log.e(TAG, "Fehler beim Erstellen des Radar-Daten-Verzeichnisses: ${radarDir.absolutePath}")
+            }
+        } else {
+            Log.d(TAG, "Radar-Daten-Verzeichnis existiert bereits: ${radarDir.absolutePath}")
+        }
+        return radarDir
+    }
+
+    /**
+     * Lädt die aktuellste RADOLAN-RW-Datei (bz2) herunter, entpackt sie und speichert sie lokal.
+     * @param context Der Android Context, z.B. Ihre MainActivity.
+     * @param onSuccess Eine Callback-Funktion, die mit dem Pfad zur *entpackten* Datei aufgerufen wird.
+     * @param onFailure Eine Callback-Funktion, die bei einem Fehler aufgerufen wird.
+     */
+    fun downloadAndPrepareLatestRadarFile(
+        context: Context,
+        onSuccess: (String) -> Unit,
+        onFailure: (Exception) -> Unit
+    ) {
+        val radarDir = getRadarDataDir(context)
+        if (!radarDir.exists() || !radarDir.isDirectory) {
+            Log.e(TAG, "Radar-Daten-Verzeichnis ist nicht verfügbar oder kein Verzeichnis.")
+            onFailure(Exception("Radar-Daten-Verzeichnis nicht verfügbar."))
+            return
+        }
+
+        val request = Request.Builder()
+            .url(RW_LATEST_URL)
+            .build()
+
+        Log.d(TAG, "Starte Download von: $RW_LATEST_URL")
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.e(TAG, "Download fehlgeschlagen (onFailure): ${e.message}", e)
+                if (e is java.net.SocketTimeoutException) {
+                    Log.e(TAG, "Download-Timeout.")
+                } else if (e is java.net.UnknownHostException) {
+                    Log.e(TAG, "Kann Host nicht auflösen (Netzwerkprobleme?).")
+                }
+                onFailure(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                Log.d(TAG, "Download-Antwort erhalten. Code: ${response.code}, Message: ${response.message}")
+                if (!response.isSuccessful) {
+                    val error = Exception("Download fehlgeschlagen: ${response.code} - ${response.message}")
+                    Log.e(TAG, error.message ?: "Unbekannter Download-Fehler (onResponse)")
+                    onFailure(error)
+                    return
+                }
+
+                val responseBody = response.body
+                if (responseBody == null) {
+                    val error = Exception("Download fehlgeschlagen: Antwort hat keinen Body")
+                    Log.e(TAG, error.message ?: "Kein Antwort-Body (onResponse)")
+                    onFailure(error)
+                    return
+                }
+
+                try {
+                    val fileNameToUse = RW_LATEST_FILENAME // Nutze den festen Namen der bz2-Datei
+                    val downloadedFile = File(radarDir, fileNameToUse)
+
+                    Log.d(TAG, "Speichere Antwort-Body in Datei: ${downloadedFile.absolutePath}")
+
+                    // Schreibe den Antwort-Body in die Datei
+                    downloadedFile.sink().buffer().use { output ->
+                        output.writeAll(responseBody.source())
+                    }
+                    Log.d(TAG, "Datei erfolgreich heruntergeladen und gespeichert: ${downloadedFile.absolutePath}")
+
+                    // Entpacken, falls die Datei .bz2 ist
+                    val unpackedFile = if (downloadedFile.name.endsWith(".bz2")) {
+                        Log.d(TAG, "Erkannte gepackte Datei (.bz2), versuche zu entpacken...")
+                        unpackBzip2File(downloadedFile, radarDir)
+                    } else {
+                        Log.d(TAG, "Datei ist nicht gepackt (.bz2), verwende Originaldatei.")
+                        downloadedFile // Wenn keine .bz2-Datei, verwende das Original
+                    }
+
+                    if (unpackedFile != null && unpackedFile.exists()) {
+                        Log.d(TAG, "Datei erfolgreich vorbereitet: ${unpackedFile.absolutePath}")
+                        onSuccess(unpackedFile.absolutePath)
+                    } else {
+                        val error = Exception("Fehler beim Entpacken oder Datei existiert nicht nach Entpacken.")
+                        Log.e(TAG, error.message ?: "Unbekannter Fehler nach Download und Entpacken")
+                        onFailure(error)
+                    }
+
+                } catch (e: Exception) {
+                    Log.e(TAG, "Fehler beim Speichern oder Entpacken (onResponse): ${e.message}", e)
+                    onFailure(e)
+                }
+            }
+        })
+    }
+
+    /**
+     * Entpackt eine .bz2-Datei in das angegebene Verzeichnis.
+     * @param bz2File Die gepackte Datei.
+     * @param outputDir Das Verzeichnis, in das entpackt werden soll.
+     * @return Die entpackte Datei oder null bei Fehler.
+     */
+    private fun unpackBzip2File(bz2File: File, outputDir: File): File? {
+        val outputFileName = bz2File.name.removeSuffix(".bz2")
+        val outputFile = File(outputDir, outputFileName)
+
+        Log.d(TAG, "Entpacke ${bz2File.absolutePath} nach ${outputFile.absolutePath}")
+
+        try {
+            BZip2CompressorInputStream(bz2File.inputStream()).use { bz2Input ->
+                outputFile.outputStream().use { output ->
+                    bz2Input.copyTo(output)
+                }
+            }
+            Log.d(TAG, "Datei erfolgreich entpackt: ${outputFile.absolutePath}")
+            // Optional: Lösche die gepackte Datei nach erfolgreichem Entpacken
+            // bz2File.delete()
+            return outputFile
+        } catch (e: IOException) {
+            Log.e(TAG, "Fehler beim Entpacken von ${bz2File.absolutePath}: ${e.message}", e)
+            return null
+        }
+    }
+}
